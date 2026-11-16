@@ -1,0 +1,12 @@
+# Render.com free web service for the KoGyi Mikhmon voucher bot.
+# In Render: New + -> Web Service -> connect your GitHub repo with these
+# files -> the blueprint below is picked up automatically.
+# Then set the Environment Variables in the Render dashboard:
+#   TELEGRAM_TOKEN, ROUTER_HOST, ROUTER_USER, ROUTER_PASSWORD
+# (ROUTER_PORT defaults to 8728. Never put secrets in the repo.)
+services:
+  - type: web
+    name: mikhmon-voucher-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
