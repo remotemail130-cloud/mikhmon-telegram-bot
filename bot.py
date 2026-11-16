@@ -3,17 +3,17 @@
 """
 KoGyi Mikhmon Voucher Bot
 =========================
-Telegram ကနေ voucher code တစ္ခု ပို့လိုက်ရင်
-Router (MikroTik) ထဲကေန အဲဒီ code ကို ရွာျပီး အခ်က္အလက္ ျပန္ပို႔ေပးတဲ့ bot။
+Telegram ကနေ voucher code တစ်ခု ပို့လိုက်ရင်
+Router (MikroTik) ထဲကနေ အဲဒီ code ကို ရှာပြီး အချက်အလက် ပြန်ပို့ပေးတဲ့ bot။
 
-ဘယ္လို အလုပ္လုပ္လဲ
-- Mikhmon က voucher ေရာင္းတိုင္း Router ထဲမွာ
-  /system/script (comment = mikhmon) အျဖစ္ မွတ္ထားတယ္။
-  အဲဒီ record ထဲမွာ ရက္၊ အခ်ိန္၊ username(code)၊ ေဈး၊ profile၊ comment ပါတယ္။
-- Hotspot user အေနနဲ႔လည္း /ip/hotspot/user ထဲမွာ ရွိတယ္။
-- ဒီ bot က Router API (port 8728) နဲ႔ ခ်ိတ္ၿပီး ႏွစ္ခုလုံးကို ရွာၿပီး ျပန္ပို႔တယ္။
+ဘယ်လို အလုပ်လုပ်လဲ
+- Mikhmon က voucher ရောင်းတိုင်း Router ထဲမှာ
+  /system/script (comment = mikhmon) အဖြစ် မှတ်ထားတယ်။
+  အဲဒီ record ထဲမှာ ရက်၊ အချိန်၊ username(code)၊ ဈေး၊ profile၊ comment ပါတယ်။
+- Hotspot user အနေနဲ့လည်း /ip/hotspot/user ထဲမှာ ရှိတယ်။
+- ဒီ bot က Router API (port 8728) နဲ့ ချိတ်ပြီး နှစ်ခုလုံးကို ရှာပြီး ပြန်ပို့တယ်။
 
-Run နည္း (X390, Windows)
+Run နည်း (X390, Windows)
 1. Python သွင်း (python.org) — install လုပ်တုန်း "Add Python to PATH" ကို အမှန်ခြစ်ပါ။
 2. config.example.json ကို config.json လို့ ကူးပြီး ဖြည့်ပါ (token, router IP/user/password)။
 3. pip install -r requirements.txt
@@ -57,7 +57,7 @@ def load_config():
             "router_password": os.environ.get("ROUTER_PASSWORD", ""),
             "allowed_ids": [],
         }
-    print("config.json မေတြ႕ဘူး — config.example.json ကို config.json လို႔ ကူးၿပီး ျဖည့္ပါ။")
+    print("config.json မတွေ့ဘူး — config.example.json ကို config.json လို့ ကူးပြီး ဖြည့်ပါ။")
     sys.exit(1)
 
 
@@ -66,7 +66,7 @@ ALLOWED_IDS = set(CFG.get("allowed_ids") or [])
 
 
 def ros_api():
-    """Router API ကို ခ်ိတ္ၿပီး api object ျပန္ေပးတယ္။"""
+    """Router API ကို ချိတ်ပြီး api object ပြန်ပေးတယ်။"""
     return ros_connect(
         username=CFG["router_user"],
         password=CFG["router_password"],
@@ -76,7 +76,7 @@ def ros_api():
 
 
 def find_voucher(code):
-    """code နဲ႔ ကိုက္တဲ့ hotspot user + ေရာင္းတဲ့ record ကို ရွာတယ္။
+    """code နဲ့ ကိုက်တဲ့ hotspot user + ရောင်းတဲ့ record ကို ရှာတယ်။
     Returns: (user_dict | None, [sale_dict, ...])"""
     api = ros_api()
     try:
@@ -119,43 +119,43 @@ def find_voucher(code):
 def format_reply(code, user, sales):
     if user is None and not sales:
         return (
-            "❌ ဒီ code နဲ႔ voucher မေတြ႕ဘူး\n"
+            "❌ ဒီ code နဲ့ voucher မတွေ့ဘူး\n"
             "Code: " + code + "\n"
-            "code မွန္မမွန္ ျပန္စစ္ေပးပါ။"
+            "code မှန်မမှန် ပြန်စစ်ပေးပါ။"
         )
 
     lines = ["🎫 Voucher: " + code, ""]
 
     if sales:
-        # ေနာက္ဆုံး ေရာင္းတဲ့ record ကို အဓိက ျပတယ္
+        # နောက်ဆုံး ရောင်းတဲ့ record ကို အဓိက ပြတယ်
         s = sales[-1]
         if s["profile"]:
             lines.append("👤 Profile: " + s["profile"])
         if s["price"]:
-            lines.append("💰 ေဈး: " + s["price"])
+            lines.append("💰 ဈေး: " + s["price"])
         if s["date"]:
-            lines.append("📅 ေရာင္းတဲ့ ရက္: " + s["date"] + (" " + s["time"] if s["time"] else ""))
+            lines.append("📅 ရောင်းတဲ့ ရက်: " + s["date"] + (" " + s["time"] if s["time"] else ""))
         if s["comment"]:
             lines.append("💬 Comment: " + s["comment"])
         if len(sales) > 1:
-            lines.append("🔁 ဒီ code နဲ႔ ေရာင္းထားတာ " + str(len(sales)) + " ခု ရွိတယ္ (ေနာက္ဆုံးတစ္ခုကို ျပထားတယ္)")
+            lines.append("🔁 ဒီ code နဲ့ ရောင်းထားတာ " + str(len(sales)) + " ခု ရှိတယ် (နောက်ဆုံးတစ်ခုကို ပြထားတယ်)")
 
     if user is not None:
         lines.append("")
-        lines.append("📶 Hotspot user ရွိတယ္:")
+        lines.append("📶 Hotspot user ရှိတယ်:")
         if user.get("profile"):
             lines.append("👤 Profile: " + str(user["profile"]))
         if user.get("limit-uptime"):
-            lines.append("⏳ သုံးခြင့္ အခ်ိန္: " + str(user["limit-uptime"]))
+            lines.append("⏳ သုံးခွင့် အချိန်: " + str(user["limit-uptime"]))
         if user.get("uptime"):
-            lines.append("⏱ သုံးၿပီးသား အခ်ိန္: " + str(user["uptime"]))
+            lines.append("⏱ သုံးပြီးသား အချိန်: " + str(user["uptime"]))
         disabled = str(user.get("disabled", "false")).lower() == "true"
-        lines.append("📌 အေနအထား: " + ("❌ ပိတ္ထားတယ္ (disabled)" if disabled else "✅ ဖြင့္ထားတယ္"))
+        lines.append("📌 အနေအထား: " + ("❌ ပိတ်ထားတယ် (disabled)" if disabled else "✅ ဖွင့်ထားတယ်"))
         if user.get("comment"):
             lines.append("💬 Comment: " + str(user["comment"]))
     else:
         lines.append("")
-        lines.append("📶 Hotspot user မေတြ႕ဘူး (ဖ်က္ထားတာ / သက္တမ္းကုန္တာ ျဖစ္ႏိုင္တယ္)")
+        lines.append("📶 Hotspot user မတွေ့ဘူး (ဖျက်ထားတာ / သက်တမ်းကုန်တာ ဖြစ်နိုင်တယ်)")
 
     return "\n".join(lines)
 
@@ -169,39 +169,39 @@ def is_allowed(update):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
-        await update.message.reply_text("ဒီ bot ကို သုံးခြင့္ မရွိဘူး။")
+        await update.message.reply_text("ဒီ bot ကို သုံးခွင့် မရှိဘူး။")
         return
     await update.message.reply_text(
         "မင်္ဂလာပါ ကိုကြီး! 🎫\n"
-        "Voucher code တစ္ခု ပို႔လိုက္ရင္ အဲဒီ voucher ရဲ့ အခ်က္အလက္\n"
-        "(Profile, ေဈး, ေရာင္းတဲ့ ရက္, အေနအထား) ကို ရွာၿပီး ျပန္ပို႔ေပးမယ္။\n\n"
+        "Voucher code တစ်ခု ပို့လိုက်ရင် အဲဒီ voucher ရဲ့ အချက်အလက်\n"
+        "(Profile, ဈေး, ရောင်းတဲ့ ရက်, အနေအထား) ကို ရှာပြီး ပြန်ပို့ပေးမယ်။\n\n"
         "ဥပမာ: ABC123"
     )
 
 
 async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
-        await update.message.reply_text("ဒီ bot ကို သုံးခြင့္ မရွိဘူး။")
+        await update.message.reply_text("ဒီ bot ကို သုံးခွင့် မရှိဘူး။")
         return
     code = (update.message.text or "").strip()
     if not code:
         return
     if len(code) > 64:
-        await update.message.reply_text("Code က ရွည္လြန္းတယ္ — voucher code အတိုေလးပဲ ပို႔ေပးပါ။")
+        await update.message.reply_text("Code က ရှည်လွန်းတယ် — voucher code အတိုလေးပဲ ပို့ပေးပါ။")
         return
     try:
         user, sales = find_voucher(code)
     except LibRouterosError as e:
         log.error("Router error: %s", e)
         await update.message.reply_text(
-            "⚠️ Router နဲ႔ ခ်ိတ္လို႔ မရဘူး။\n"
-            "Laptop ဖြင့္ထားလား, Router API (port 8728) ဖြင့္ထားလား,\n"
-            "config.json ထဲက router IP / password မွန္လား စစ္ေပးပါ။"
+            "⚠️ Router နဲ့ ချိတ်လို့ မရဘူး။\n"
+            "Laptop ဖွင့်ထားလား, Router API (port 8728) ဖွင့်ထားလား,\n"
+            "config.json ထဲက router IP / password မှန်လား စစ်ပေးပါ။"
         )
         return
     except Exception as e:
         log.error("Lookup error: %s", e)
-        await update.message.reply_text("⚠️ Error ျဖစ္သြားတယ္ — ခဏေန ျပန္စမ္းေပးပါ။")
+        await update.message.reply_text("⚠️ Error ဖြစ်သွားတယ် — ခဏနေ ပြန်စမ်းပေးပါ။")
         return
     await update.message.reply_text(format_reply(code, user, sales))
 
@@ -241,13 +241,13 @@ def start_health_server():
 def main():
     token = CFG.get("telegram_token", "")
     if not token or token.startswith("123456:"):
-        print("config.json ထဲက telegram_token ကို အရင္ ျဖည့္ပါ (@BotFather ကေန ရတဲ့ token)။")
+        print("config.json ထဲက telegram_token ကို အရင် ဖြည့်ပါ (@BotFather ကနေ ရတဲ့ token)။")
         sys.exit(1)
     start_health_server()
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lookup))
-    log.info("Bot စတင္ေနၿပီ — Telegram ကေန voucher code ပို႔ၿပီး စမ္းၾကည့္ပါ။")
+    log.info("Bot စတင်နေပြီ — Telegram ကနေ voucher code ပို့ပြီး စမ်းကြည့်ပါ။")
     app.run_polling()
 
 
