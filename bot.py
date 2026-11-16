@@ -18,14 +18,21 @@ Run နည်း (X390, Windows)
 2. config.example.json ကို config.json လို့ ကူးပြီး ဖြည့်ပါ (token, router IP/user/password)။
 3. pip install -r requirements.txt
 4. python bot.py
+
+Render (cloud) မှာ run ရင်: Telegram message က webhook နဲ့ လာတယ်။
+Render က အိမ်တွင်း LAN (192.168.4.1) ကို တိုက်ရိုက် မရောက်နိုင်လို့
+voucher lookup တွေကို /pending မှာ စုထားပြီး
+X390 ပေါ်က helper.py က လာယူ၊ router ကို LAN ထဲကနေ မေး၊
+Telegram Bot API ကနေ အဖြေကို တိုက်ရိုက် ပြန်ပို့ပေးတယ်။
 """
 
+import asyncio
 import json
 import logging
 import os
 import sys
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+import uuid
 
 from librouteros import connect as ros_connect
 from librouteros.exceptions import LibRouterosError
@@ -64,6 +71,53 @@ def load_config():
 CFG = load_config()
 ALLOWED_IDS = set(CFG.get("allowed_ids") or [])
 
+# Pending voucher lookups, for the laptop helper (X390) to pick up.
+# Render cannot reach the home LAN, so the bot queues lookups here;
+# the helper polls /pending, queries the router on the LAN and replies
+# to the user directly via the Telegram Bot API.
+PENDING = {}
+PENDING_LOCK = asyncio.Lock()
+REQUEST_TTL = 30 * 60  # seconds; old requests are dropped
+CLAIM_TIMEOUT = 120  # seconds; a stale claim becomes claimable again
+
+
+def _helper_secret_ok(request):
+    secret = os.environ.get("HELPER_SECRET", "")
+    if not secret:
+        return True
+    return request.headers.get("X-Helper-Secret") == secret
+
+
+async def queue_lookup(chat_id, code):
+    rid = uuid.uuid4().hex[:8]
+    async with PENDING_LOCK:
+        PENDING[rid] = {
+            "id": rid,
+            "chat_id": chat_id,
+            "code": code,
+            "ts": time.time(),
+            "claimed": False,
+            "claimed_at": 0.0,
+        }
+    return rid
+
+
+async def _nudge_if_pending(bot, chat_id, rid):
+    """If nobody picked up the lookup after 90s, tell the user the
+    laptop helper is probably not running."""
+    await asyncio.sleep(90)
+    async with PENDING_LOCK:
+        still = rid in PENDING
+    if still:
+        try:
+            await bot.send_message(
+                chat_id,
+                "⚠️ Helper မဖွင့်ထားဘူးလို့ ထင်တယ် — laptop မှာ helper.py ဖွင့်ထားမှ "
+                "voucher ရှာပေးနိုင်မယ်။ ဖွင့်ပြီးရင် code ပြန်ပို့ပေးပါ။",
+            )
+        except Exception:
+            pass
+
 
 def ros_api():
     """Router API ကို ချိတ်ပြီး api object ပြန်ပေးတယ်။"""
@@ -72,6 +126,7 @@ def ros_api():
         password=CFG["router_password"],
         host=CFG["router_host"],
         port=int(CFG.get("router_port", 8728)),
+        timeout=5,
     )
 
 
@@ -189,6 +244,14 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(code) > 64:
         await update.message.reply_text("Code က ရှည်လွန်းတယ် — voucher code အတိုလေးပဲ ပို့ပေးပါ။")
         return
+    if os.environ.get("PORT"):
+        # Render (cloud): cannot reach the home LAN router, so queue
+        # the lookup for the laptop helper (helper.py on the X390).
+        rid = await queue_lookup(update.effective_chat.id, code)
+        asyncio.create_task(_nudge_if_pending(context.bot, update.effective_chat.id, rid))
+        await update.message.reply_text(f"🔍 '{code}' ကို ရှာနေတယ် — ခဏစောင့်ပါ။")
+        return
+    # Laptop: direct lookup, the router is on the same LAN.
     try:
         user, sales = find_voucher(code)
     except LibRouterosError as e:
@@ -206,36 +269,100 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_reply(code, user, sales))
 
 
-def start_health_server():
-    """Free hosts (Render) sleep when idle - a tiny HTTP server on $PORT
-    lets UptimeRobot ping the service every 5 min to keep it awake.
-    Does nothing on the laptop (no PORT set there)."""
-    port = os.environ.get("PORT")
-    if not port:
-        return
-    try:
-        port = int(port)
-    except ValueError:
-        return
+def create_web_app(app, token):
+    """aiohttp app serving the Telegram webhook AND the helper queue
+    endpoints (/pending, /claim, /done) on the same $PORT.
+    Split out of run_webhook_mode so the routes can be tested without
+    talking to Telegram."""
+    from aiohttp import web
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
+    async def handle_root(request):
+        return web.Response(text="OK")
 
-        def log_message(self, *args):
-            pass
-
-    def serve():
+    async def handle_telegram(request):
         try:
-            HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+            data = await request.json()
+            update = Update.de_json(data, app.bot)
+            if update is not None:
+                await app.process_update(update)
         except Exception as e:
-            log.warning("Health server failed: %s", e)
+            log.error("Webhook update error: %s", e)
+        return web.Response(text="OK")
 
-    threading.Thread(target=serve, daemon=True).start()
-    log.info("Health server listening on port %s", port)
+    async def handle_pending(request):
+        if not _helper_secret_ok(request):
+            return web.Response(status=401, text="unauthorized")
+        now = time.time()
+        async with PENDING_LOCK:
+            for rid in list(PENDING):
+                r = PENDING[rid]
+                if now - r["ts"] > REQUEST_TTL:
+                    del PENDING[rid]
+                elif r["claimed"] and now - r["claimed_at"] > CLAIM_TIMEOUT:
+                    r["claimed"] = False
+                    r["claimed_at"] = 0.0
+            reqs = [r for r in PENDING.values() if not r["claimed"]]
+        return web.json_response({"requests": reqs})
+
+    async def handle_claim(request):
+        if not _helper_secret_ok(request):
+            return web.Response(status=401, text="unauthorized")
+        data = await request.json()
+        rid = data.get("id", "")
+        async with PENDING_LOCK:
+            r = PENDING.get(rid)
+            if not r or r["claimed"]:
+                return web.Response(status=404, text="not found")
+            r["claimed"] = True
+            r["claimed_at"] = time.time()
+            return web.json_response(r)
+
+    async def handle_done(request):
+        if not _helper_secret_ok(request):
+            return web.Response(status=401, text="unauthorized")
+        data = await request.json()
+        rid = data.get("id", "")
+        async with PENDING_LOCK:
+            PENDING.pop(rid, None)
+        return web.json_response({"ok": True})
+
+    webapp = web.Application()
+    webapp.router.add_get("/", handle_root)
+    webapp.router.add_post("/" + token, handle_telegram)
+    webapp.router.add_get("/pending", handle_pending)
+    webapp.router.add_post("/claim", handle_claim)
+    webapp.router.add_post("/done", handle_done)
+    return webapp
+
+
+async def run_webhook_mode(app, token, port):
+    """Render: webhook mode. A Telegram message wakes the sleeping
+    service; the aiohttp server handles the Telegram webhook AND the
+    helper queue endpoints (/pending, /claim, /done) on the same $PORT."""
+    base = (
+        os.environ.get("WEBHOOK_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or "https://mikhmon-telegram-bot.onrender.com"
+    ).rstrip("/")
+    webhook_url = base + "/" + token
+    await app.initialize()
+    await app.start()
+    await app.bot.set_webhook(url=webhook_url)
+    log.info("Bot စတင်နေပြီ (webhook) — %s", base)
+
+    from aiohttp import web
+
+    webapp = create_web_app(app, token)
+    runner = web.AppRunner(webapp)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+        await app.stop()
+        await app.shutdown()
 
 
 def main():
@@ -248,25 +375,11 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lookup))
     port = os.environ.get("PORT")
     if port:
-        # Render (free): webhook mode — the service sleeps when idle and
-        # a Telegram message itself wakes it up (no 24h running, no
-        # UptimeRobot needed). First reply after sleep takes ~1 min.
-        base = (
-            os.environ.get("WEBHOOK_URL")
-            or os.environ.get("RENDER_EXTERNAL_URL")
-            or "https://mikhmon-telegram-bot.onrender.com"
-        ).rstrip("/")
-        webhook_url = base + "/" + token
-        log.info("Bot စတင်နေပြီ (webhook) — %s", base)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=int(port),
-            url_path=token,
-            webhook_url=webhook_url,
-        )
+        # Render (free): webhook mode — a Telegram message wakes the
+        # sleeping service; lookups are queued for the laptop helper.
+        asyncio.run(run_webhook_mode(app, token, int(port)))
     else:
         # Laptop: polling mode, no PORT set there.
-        start_health_server()
         log.info("Bot စတင်နေပြီ — Telegram ကနေ voucher code ပို့ပြီး စမ်းကြည့်ပါ။")
         app.run_polling()
 
