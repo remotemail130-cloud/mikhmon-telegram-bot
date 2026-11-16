@@ -144,9 +144,60 @@ def ros_api():
     )
 
 
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+
+def parse_duration(s):
+    """RouterOS duration ('11w1d5h36m7s', '2h15m', '45s') -> seconds."""
+    total = 0
+    mult = {"w": 7 * 24 * 3600, "d": 24 * 3600, "h": 3600, "m": 60, "s": 1}
+    for num, unit in re.findall(r"(\d+)\s*([wdhms])", str(s or "").lower()):
+        total += int(num) * mult[unit]
+    return total
+
+
+def format_bytes(n):
+    """Bytes -> '1.23 GB' / '345.67 MB' / '12.34 KB' / '123 B'."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(n)} B"
+            return f"{n:.2f} {unit}"
+        n /= 1024
+    return f"{n:.2f} TB"
+
+
+def session_start_str(clock, uptime_s):
+    """Router clock - session uptime -> '16/11/2026 17:29' ('' if unknown).
+    clock = /system/clock/print item: date 'nov/16/2026', time '19:45:00'."""
+    if not clock or not uptime_s:
+        return ""
+    try:
+        from datetime import datetime, timedelta
+        date_s = str(clock.get("date", "")).strip().lower()
+        time_s = str(clock.get("time", "")).strip()
+        mon, day, year = date_s.split("/")
+        month = _MONTHS.get(mon[:3])
+        if not month:
+            return ""
+        parts = [int(p) for p in time_s.split(":")][:3]
+        while len(parts) < 3:
+            parts.append(0)
+        now = datetime(int(year), month, int(day), parts[0], parts[1], parts[2])
+        start = now - timedelta(seconds=int(uptime_s))
+        return start.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return ""
+
+
 def find_voucher(code):
     """code နဲ့ ကိုက်တဲ့ hotspot user + ရောင်းတဲ့ record ကို ရှာတယ်။
-    Returns: (user_dict | None, [sale_dict, ...])"""
+    Returns: (user_dict | None, [sale_dict, ...], active_session | None, clock | None)"""
     api = ros_api()
     try:
         users = list(api("/ip/hotspot/user/print"))
@@ -155,6 +206,11 @@ def find_voucher(code):
         # only the command positionally, so passing the query as a 2nd
         # positional arg raises TypeError and every lookup would fail.
         scripts = list(api.rawCmd("/system/script/print", "?comment=mikhmon"))
+        try:
+            active_list = list(api("/ip/hotspot/active/print"))
+            clock_list = list(api("/system/clock/print"))
+        except Exception:
+            active_list, clock_list = [], []
     finally:
         try:
             api.close()
@@ -169,6 +225,14 @@ def find_voucher(code):
             user = u
             break
 
+    active = None
+    for a in active_list:
+        if str(a.get("user", "")).strip().lower() == code_low:
+            active = a
+            break
+
+    clock = clock_list[0] if clock_list else None
+
     sales = []
     for s in scripts:
         name = str(s.get("name", ""))
@@ -182,10 +246,10 @@ def find_voucher(code):
                 "profile": parts[7] if len(parts) > 7 else "",
                 "comment": parts[8] if len(parts) > 8 else "",
             })
-    return user, sales
+    return user, sales, active, clock
 
 
-def format_reply(code, user, sales):
+def format_reply(code, user, sales, active=None, clock=None):
     if user is None and not sales:
         return (
             "❌ ဒီ code နဲ့ voucher မတွေ့ဘူး\n"
@@ -218,10 +282,36 @@ def format_reply(code, user, sales):
             lines.append("⏳ သုံးခွင့် အချိန်: " + str(user["limit-uptime"]))
         if user.get("uptime"):
             lines.append("⏱ သုံးပြီးသား အချိန်: " + str(user["uptime"]))
+        # Total usage — bytes-in + bytes-out (user record မှာ စုစုပေါင်း သိမ်းထားတယ်)
+        try:
+            b_in = int(float(str(user.get("bytes-in", 0) or 0)))
+            b_out = int(float(str(user.get("bytes-out", 0) or 0)))
+        except (TypeError, ValueError):
+            b_in = b_out = 0
+        if b_in or b_out:
+            lines.append("📊 Total Usage: " + format_bytes(b_in + b_out)
+                         + " (ဆွဲ " + format_bytes(b_out)
+                         + " / တင် " + format_bytes(b_in) + ")")
         disabled = str(user.get("disabled", "false")).lower() == "true"
         lines.append("📌 အနေအထား: " + ("❌ ပိတ်ထားတယ် (disabled)" if disabled else "✅ ဖွင့်ထားတယ်"))
         if user.get("comment"):
             lines.append("💬 Comment: " + str(user["comment"]))
+        # Online ဖြစ်နေရင် MAC + IP + စသုံးတဲ့ အချိန် ပြတယ်
+        # (offline ဆို router က MAC ကို မှတ်မထားဘူး)
+        if active is not None:
+            lines.append("")
+            lines.append("🟢 အခု online ဖြစ်နေတယ်:")
+            if active.get("address"):
+                lines.append("🌐 IP: " + str(active["address"]))
+            if active.get("mac-address"):
+                lines.append("📱 MAC: " + str(active["mac-address"]))
+            if active.get("uptime"):
+                lines.append("⏱ ဒီတစ်ခါ သုံးနေတာ: " + str(active["uptime"]))
+                start = session_start_str(clock, parse_duration(active["uptime"]))
+                if start:
+                    lines.append("🕐 စသုံးတဲ့ အချိန်: " + start)
+        else:
+            lines.append("⚪ အခု offline ဖြစ်နေတယ် (MAC မသိရဘူး)")
     else:
         lines.append("")
         lines.append("📶 Hotspot user မတွေ့ဘူး (ဖျက်ထားတာ / သက်တမ်းကုန်တာ ဖြစ်နိုင်တယ်)")
@@ -243,7 +333,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "မင်္ဂလာပါ ကိုကြီး! 🎫\n"
         "Voucher code တစ်ခု ပို့လိုက်ရင် အဲဒီ voucher ရဲ့ အချက်အလက်\n"
-        "(Profile, ဈေး, ရောင်းတဲ့ ရက်, အနေအထား) ကို ရှာပြီး ပြန်ပို့ပေးမယ်။\n\n"
+        "(Profile, ဈေး, ရောင်းတဲ့ ရက်, အနေအထား, Total Usage, MAC, စသုံးတဲ့ အချိန်) ကို ရှာပြီး ပြန်ပို့ပေးမယ်။\n\n"
         "ဥပမာ: ABC123\n\n"
         "KBZPay screenshot တွေ ပို့ပြီး /pdf လို့ ရိုက်ရင်\n"
         "transaction စာရင်း (A4 portrait) PDF ထုတ်ပေးမယ်။"
@@ -269,7 +359,7 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # Laptop: direct lookup, the router is on the same LAN.
     try:
-        user, sales = find_voucher(code)
+        user, sales, active, clock = find_voucher(code)
     except LibRouterosError as e:
         log.error("Router error: %s", e)
         await update.message.reply_text(
@@ -282,7 +372,7 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.error("Lookup error: %s", e)
         await update.message.reply_text("⚠️ Error ဖြစ်သွားတယ် — ခဏနေ ပြန်စမ်းပေးပါ။")
         return
-    await update.message.reply_text(format_reply(code, user, sales))
+    await update.message.reply_text(format_reply(code, user, sales, active, clock))
 
 
 def yangon_today():
@@ -439,7 +529,6 @@ def build_table_pdf(transactions):
     f_head = _load_font("DejaVuSans-Bold.ttf", 28)
     f_row = _load_font("DejaVuSans.ttf", 28)
     f_tot = _load_font("DejaVuSans-Bold.ttf", 30)
-
     today = yangon_today()
     title = "KBZPay Transactions  -  " + today.strftime("%d %b %Y")
     col_date = MARGIN
