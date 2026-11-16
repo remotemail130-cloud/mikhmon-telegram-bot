@@ -243,12 +243,32 @@ def main():
     if not token or token.startswith("123456:"):
         print("config.json ထဲက telegram_token ကို အရင် ဖြည့်ပါ (@BotFather ကနေ ရတဲ့ token)။")
         sys.exit(1)
-    start_health_server()
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lookup))
-    log.info("Bot စတင်နေပြီ — Telegram ကနေ voucher code ပို့ပြီး စမ်းကြည့်ပါ။")
-    app.run_polling()
+    port = os.environ.get("PORT")
+    if port:
+        # Render (free): webhook mode — the service sleeps when idle and
+        # a Telegram message itself wakes it up (no 24h running, no
+        # UptimeRobot needed). First reply after sleep takes ~1 min.
+        base = (
+            os.environ.get("WEBHOOK_URL")
+            or os.environ.get("RENDER_EXTERNAL_URL")
+            or "https://mikhmon-telegram-bot.onrender.com"
+        ).rstrip("/")
+        webhook_url = base + "/" + token
+        log.info("Bot စတင်နေပြီ (webhook) — %s", base)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(port),
+            url_path=token,
+            webhook_url=webhook_url,
+        )
+    else:
+        # Laptop: polling mode, no PORT set there.
+        start_health_server()
+        log.info("Bot စတင်နေပြီ — Telegram ကနေ voucher code ပို့ပြီး စမ်းကြည့်ပါ။")
+        app.run_polling()
 
 
 if __name__ == "__main__":
