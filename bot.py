@@ -197,7 +197,8 @@ def session_start_str(clock, uptime_s):
 
 def find_voucher(code):
     """code နဲ့ ကိုက်တဲ့ hotspot user + ရောင်းတဲ့ record ကို ရှာတယ်။
-    Returns: (user_dict | None, [sale_dict, ...], active_session | None, clock | None)"""
+    Returns: (user_dict | None, [sale_dict, ...], active_session | None,
+              clock | None, device_name | "")"""
     api = ros_api()
     try:
         users = list(api("/ip/hotspot/user/print"))
@@ -209,8 +210,9 @@ def find_voucher(code):
         try:
             active_list = list(api("/ip/hotspot/active/print"))
             clock_list = list(api("/system/clock/print"))
+            lease_list = list(api("/ip/dhcp-server/lease/print"))
         except Exception:
-            active_list, clock_list = [], []
+            active_list, clock_list, lease_list = [], [], []
     finally:
         try:
             api.close()
@@ -233,6 +235,29 @@ def find_voucher(code):
 
     clock = clock_list[0] if clock_list else None
 
+    # Device name: DHCP lease table က host-name ကို MAC (သို့) IP နဲ့ တိုက်တယ်။
+    device_name = ""
+    if active is not None:
+        act_ip = str(active.get("address", "")).strip()
+        act_mac = str(active.get("mac-address", "")).strip().lower()
+
+        def lease_name(lease):
+            return (str(lease.get("active-host-name", "") or "").strip()
+                    or str(lease.get("host-name", "") or "").strip())
+
+        if act_mac:  # MAC နဲ့ တိုက်တာ အတိကျဆုံး
+            for lease in lease_list:
+                l_mac = str(lease.get("mac-address", "")).strip().lower()
+                l_amac = str(lease.get("active-mac-address", "")).strip().lower()
+                if l_mac == act_mac or l_amac == act_mac:
+                    device_name = lease_name(lease)
+                    break
+        if not device_name and act_ip:  # MAC မတိုက်ရင် IP နဲ့ စမ်းတယ်
+            for lease in lease_list:
+                if str(lease.get("address", "")).strip() == act_ip:
+                    device_name = lease_name(lease)
+                    break
+
     sales = []
     for s in scripts:
         name = str(s.get("name", ""))
@@ -246,10 +271,10 @@ def find_voucher(code):
                 "profile": parts[7] if len(parts) > 7 else "",
                 "comment": parts[8] if len(parts) > 8 else "",
             })
-    return user, sales, active, clock
+    return user, sales, active, clock, device_name
 
 
-def format_reply(code, user, sales, active=None, clock=None):
+def format_reply(code, user, sales, active=None, clock=None, device_name=""):
     if user is None and not sales:
         return (
             "❌ ဒီ code နဲ့ voucher မတွေ့ဘူး\n"
@@ -305,6 +330,10 @@ def format_reply(code, user, sales, active=None, clock=None):
                 lines.append("🌐 IP: " + str(active["address"]))
             if active.get("mac-address"):
                 lines.append("📱 MAC: " + str(active["mac-address"]))
+            if device_name:
+                lines.append("💻 Device: " + device_name)
+            else:
+                lines.append("💻 Device: မသိရဘူး")
             if active.get("uptime"):
                 lines.append("⏱ ဒီတစ်ခါ သုံးနေတာ: " + str(active["uptime"]))
                 start = session_start_str(clock, parse_duration(active["uptime"]))
@@ -333,7 +362,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "မင်္ဂလာပါ ကိုကြီး! 🎫\n"
         "Voucher code တစ်ခု ပို့လိုက်ရင် အဲဒီ voucher ရဲ့ အချက်အလက်\n"
-        "(Profile, ဈေး, ရောင်းတဲ့ ရက်, အနေအထား, Total Usage, MAC, စသုံးတဲ့ အချိန်) ကို ရှာပြီး ပြန်ပို့ပေးမယ်။\n\n"
+        "(Profile, ဈေး, ရောင်းတဲ့ ရက်, အနေအထား, Total Usage, MAC, Device Name, စသုံးတဲ့ အချိန်) ကို ရှာပြီး ပြန်ပို့ပေးမယ်။\n\n"
         "ဥပမာ: ABC123\n\n"
         "KBZPay screenshot တွေ ပို့ပြီး /pdf လို့ ရိုက်ရင်\n"
         "transaction စာရင်း (A4 portrait) PDF ထုတ်ပေးမယ်။"
@@ -359,7 +388,7 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # Laptop: direct lookup, the router is on the same LAN.
     try:
-        user, sales, active, clock = find_voucher(code)
+        user, sales, active, clock, device_name = find_voucher(code)
     except LibRouterosError as e:
         log.error("Router error: %s", e)
         await update.message.reply_text(
@@ -372,7 +401,7 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.error("Lookup error: %s", e)
         await update.message.reply_text("⚠️ Error ဖြစ်သွားတယ် — ခဏနေ ပြန်စမ်းပေးပါ။")
         return
-    await update.message.reply_text(format_reply(code, user, sales, active, clock))
+    await update.message.reply_text(format_reply(code, user, sales, active, clock, device_name))
 
 
 def yangon_today():
@@ -529,6 +558,7 @@ def build_table_pdf(transactions):
     f_head = _load_font("DejaVuSans-Bold.ttf", 28)
     f_row = _load_font("DejaVuSans.ttf", 28)
     f_tot = _load_font("DejaVuSans-Bold.ttf", 30)
+
     today = yangon_today()
     title = "KBZPay Transactions  -  " + today.strftime("%d %b %Y")
     col_date = MARGIN
