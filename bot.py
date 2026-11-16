@@ -24,6 +24,10 @@ Render က အိမ်တွင်း LAN (192.168.4.1) ကို တိုက�
 voucher lookup တွေကို /pending မှာ စုထားပြီး
 X390 ပေါ်က helper.py က လာယူ၊ router ကို LAN ထဲကနေ မေး၊
 Telegram Bot API ကနေ အဖြေကို တိုက်ရိုက် ပြန်ပို့ပေးတယ်။
+
+KBZPay PDF: တစ်နေ့တာ KBZPay screenshot တွေ ပို့ပြီး /pdf လို့ ရိုက်ရင်
+A4 စာရွက်ပေါ် ၂ ပုံစီ စီပြီး PDF ထုတ်ပေးတယ် (print ထုတ်ဖို့)။
+Batch flow: screenshot အားလုံး တစ်ခါတည်း ပို့ပြီး /pdf ကို ချက်ချင်း ရိုက်ပါ။
 """
 
 import asyncio
@@ -33,6 +37,7 @@ import os
 import sys
 import time
 import uuid
+from io import BytesIO
 
 from librouteros import connect as ros_connect
 from librouteros.exceptions import LibRouterosError
@@ -79,6 +84,11 @@ PENDING = {}
 PENDING_LOCK = asyncio.Lock()
 REQUEST_TTL = 30 * 60  # seconds; old requests are dropped
 CLAIM_TIMEOUT = 120  # seconds; a stale claim becomes claimable again
+
+# KBZPay screenshots collected for the daily PDF (per chat, in memory).
+# Batch flow only: the user sends all screenshots in one go, then /pdf.
+PHOTOS = {}
+MAX_PHOTOS = 50
 
 
 def _helper_secret_ok(request):
@@ -230,7 +240,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "မင်္ဂလာပါ ကိုကြီး! 🎫\n"
         "Voucher code တစ်ခု ပို့လိုက်ရင် အဲဒီ voucher ရဲ့ အချက်အလက်\n"
         "(Profile, ဈေး, ရောင်းတဲ့ ရက်, အနေအထား) ကို ရှာပြီး ပြန်ပို့ပေးမယ်။\n\n"
-        "ဥပမာ: ABC123"
+        "ဥပမာ: ABC123\n\n"
+        "KBZPay screenshot တွေ ပို့ပြီး /pdf လို့ ရိုက်ရင်\n"
+        "တစ်နေ့တာ PDF ထုတ်ပေးမယ် (print ထုတ်ဖို့)။"
     )
 
 
@@ -267,6 +279,114 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Error ဖြစ်သွားတယ် — ခဏနေ ပြန်စမ်းပေးပါ။")
         return
     await update.message.reply_text(format_reply(code, user, sales))
+
+
+def yangon_today():
+    """Current date/time in Myanmar (UTC+6:30), without tzdata."""
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone.utc) + timedelta(hours=6, minutes=30)
+
+
+def build_pdf(photo_bytes_list):
+    """A4 pages, 2 screenshots side by side, date header.
+    Returns the PDF as bytes. (Pillow is imported lazily.)"""
+    from PIL import Image, ImageDraw, ImageFont
+
+    W, H = 1240, 1754  # A4 @ 150 dpi
+    MARGIN = 40
+    HEADER_H = 90
+    GAP = 20
+    font = None
+    for path in ("DejaVuSans.ttf",
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
+        try:
+            font = ImageFont.truetype(path, 36)
+            break
+        except Exception:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+    today = yangon_today()
+    header = "KBZPay Transactions  -  " + today.strftime("%d %b %Y")
+    pages = []
+    for i in range(0, len(photo_bytes_list), 2):
+        page = Image.new("RGB", (W, H), "white")
+        draw = ImageDraw.Draw(page)
+        draw.text((MARGIN, 30), header, fill="black", font=font)
+        draw.line([(MARGIN, HEADER_H), (W - MARGIN, HEADER_H)], fill="black", width=2)
+        pair = photo_bytes_list[i:i + 2]
+        slot_w = (W - 2 * MARGIN - GAP) // 2
+        slot_h = H - HEADER_H - MARGIN
+        slot_x = [MARGIN, MARGIN + slot_w + GAP]
+        for j, data in enumerate(pair):
+            img = Image.open(BytesIO(data)).convert("RGB")
+            img.thumbnail((slot_w, slot_h))
+            x = slot_x[j] + (slot_w - img.width) // 2
+            y = HEADER_H + 10
+            page.paste(img, (x, y))
+        pages.append(page)
+    out = BytesIO()
+    pages[0].save(out, format="PDF", save_all=True, append_images=pages[1:])
+    return out.getvalue()
+
+
+async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    photos = update.message.photo or []
+    if not photos:
+        return
+    lst = PHOTOS.setdefault(chat_id, [])
+    if len(lst) >= MAX_PHOTOS:
+        await update.message.reply_text("ဓာတ်ပုံ ၅၀ ပုံ ပြည့်သွားပြီ — /pdf လို့ ရိုက်ပြီး PDF ထုတ်လိုက်ပါ။")
+        return
+    photo = photos[-1]  # largest size
+    try:
+        tg_file = await context.bot.get_file(photo.file_id)
+        buf = BytesIO()
+        await tg_file.download_to_memory(buf)
+        lst.append(buf.getvalue())
+    except Exception as e:
+        log.error("Photo download error: %s", e)
+        await update.message.reply_text("⚠️ ပုံ download လုပ်လို့ မရဘူး — ပြန်ပို့ပေးပါ။")
+        return
+    n = len(lst)
+    await update.message.reply_text(f"📸 {n} ပုံ ရပြီ — အားလုံးပို့ပြီးရင် /pdf လို့ ရိုက်ပါ။")
+
+
+async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("ဒီ bot ကို သုံးခွင့် မရှိဘူး။")
+        return
+    chat_id = update.effective_chat.id
+    lst = PHOTOS.get(chat_id, [])
+    if not lst:
+        await update.message.reply_text("ဓာတ်ပုံ မရှိသေးဘူး — KBZPay screenshot တွေ အရင် ပို့ပေးပါ။")
+        return
+    await update.message.reply_text(f"📄 PDF ထုတ်နေတယ် — {len(lst)} ပုံ…")
+    try:
+        pdf_bytes = await asyncio.to_thread(build_pdf, list(lst))
+    except Exception as e:
+        log.error("PDF build error: %s", e)
+        await update.message.reply_text("⚠️ PDF ထုတ်လို့ မရဘူး — ပြန်စမ်းပေးပါ။")
+        return
+    today = yangon_today()
+    filename = "KBZPay-" + today.strftime("%Y-%m-%d") + ".pdf"
+    await context.bot.send_document(
+        chat_id, document=BytesIO(pdf_bytes), filename=filename,
+        caption=f"📄 {today.strftime('%d %b %Y')} — {len(lst)} ပုံ",
+    )
+    PHOTOS[chat_id] = []
+
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("ဒီ bot ကို သုံးခွင့် မရှိဘူး။")
+        return
+    PHOTOS[update.effective_chat.id] = []
+    await update.message.reply_text("🗑 ဓာတ်ပုံတွေ ဖျက်ပြီးပြီ — အစကနေ ပြန်ပို့လို့ရတယ်။")
 
 
 def create_web_app(app, token):
@@ -372,7 +492,10 @@ def main():
         sys.exit(1)
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("pdf", pdf_command))
+    app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lookup))
+    app.add_handler(MessageHandler(filters.PHOTO, receive_photo))
     port = os.environ.get("PORT")
     if port:
         # Render (free): webhook mode — a Telegram message wakes the

@@ -1,6 +1,4 @@
 python-telegram-bot[webhooks]>=21,<23
 librouteros>=3.2
 aiohttp>=3.9
-
-
-
+Pillow>=10
