@@ -25,15 +25,19 @@ voucher lookup တွေကို /pending မှာ စုထားပြီး
 X390 ပေါ်က helper.py က လာယူ၊ router ကို LAN ထဲကနေ မေး၊
 Telegram Bot API ကနေ အဖြေကို တိုက်ရိုက် ပြန်ပို့ပေးတယ်။
 
-KBZPay PDF: တစ်နေ့တာ KBZPay screenshot တွေ ပို့ပြီး /pdf လို့ ရိုက်ရင်
-A4 စာရွက်ပေါ် ၂ ပုံစီ စီပြီး PDF ထုတ်ပေးတယ် (print ထုတ်ဖို့)။
+KBZPay PDF: တစ်နေ့တာ KBZPay screenshot တွေ ပို့ရင်
+OCR (OCR.space, အခမဲ့) က ပုံထဲက transaction စာတွေ ဖတ်ပြီး
+A4 portrait စာရွက်ပေါ် ဇယား (ရက် | အကြောင်းအရာ | ငွေပမာဏ)
++ အောက်မှာ စုစုပေါင်း အဝင်/အထွက်/ကျန် အနေနဲ့ PDF ထုတ်ပေးတယ်။
 Batch flow: screenshot အားလုံး တစ်ခါတည်း ပို့ပြီး /pdf ကို ချက်ချင်း ရိုက်ပါ။
+OCR key ကို Render env var OCR_SPACE_KEY မှာ ထားရတယ်။
 """
 
 import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -85,10 +89,10 @@ PENDING_LOCK = asyncio.Lock()
 REQUEST_TTL = 30 * 60  # seconds; old requests are dropped
 CLAIM_TIMEOUT = 120  # seconds; a stale claim becomes claimable again
 
-# KBZPay screenshots collected for the daily PDF (per chat, in memory).
+# KBZPay transactions read from screenshots (per chat, in memory).
 # Batch flow only: the user sends all screenshots in one go, then /pdf.
-PHOTOS = {}
-MAX_PHOTOS = 50
+TRANSACTIONS = {}
+MAX_TXNS = 200
 
 
 def _helper_secret_ok(request):
@@ -242,7 +246,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(Profile, ဈေး, ရောင်းတဲ့ ရက်, အနေအထား) ကို ရှာပြီး ပြန်ပို့ပေးမယ်။\n\n"
         "ဥပမာ: ABC123\n\n"
         "KBZPay screenshot တွေ ပို့ပြီး /pdf လို့ ရိုက်ရင်\n"
-        "တစ်နေ့တာ PDF ထုတ်ပေးမယ် (print ထုတ်ဖို့)။"
+        "transaction စာရင်း (A4 portrait) PDF ထုတ်ပေးမယ်။"
     )
 
 
@@ -287,47 +291,222 @@ def yangon_today():
     return datetime.now(timezone.utc) + timedelta(hours=6, minutes=30)
 
 
-def build_pdf(photo_bytes_list):
-    """A4 pages, 2 screenshots side by side, date header.
-    Returns the PDF as bytes. (Pillow is imported lazily.)"""
-    from PIL import Image, ImageDraw, ImageFont
+# ---------------------------------------------------------------------------
+# KBZPay screenshot -> OCR -> text table PDF
+# ---------------------------------------------------------------------------
 
-    W, H = 1240, 1754  # A4 @ 150 dpi
-    MARGIN = 40
-    HEADER_H = 90
-    GAP = 20
-    font = None
-    for path in ("DejaVuSans.ttf",
-                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
+AMT_RE = re.compile(r"([+-]?)\s*(\d[\d,]*\.\d{2})")
+DATE_RE = re.compile(r"(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s+(\d{1,2}:\d{2}(?::\d{2})?)")
+DESC_KEYS = ("transfer", "cash in", "cash out", "payment", "receive", "top up", "bill")
+SKIP_KEYS = ("history", "all", "inflow", "outflow", "no more data",
+             "start date", "end date")
+
+
+def _parse_amount(m):
+    return float(m.group(2).replace(",", ""))
+
+
+def parse_transactions(text):
+    """OCR text -> [{"date", "time", "desc", "amount"}].
+    Amount is signed: negative = money out, positive = money in.
+    The sign comes from the OCR'd +/- when present, otherwise from the
+    transaction type (Cash In / Receive = in, everything else = out)."""
+    text = text.replace("−", "-").replace("–", "-").replace("—", "-")
+    records = []
+    current = None
+
+    def flush():
+        nonlocal current
+        if current and current.get("amount") is not None and current.get("date"):
+            records.append(current)
+        current = None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low in SKIP_KEYS or any(k in low for k in SKIP_KEYS):
+            continue
+        m_amt = AMT_RE.search(line)
+        m_date = DATE_RE.search(line)
+        desc = None
+        if any(k in low for k in DESC_KEYS):
+            desc = line
+            if m_amt:
+                desc = line[:m_amt.start()].strip(" -")
+        if desc:
+            flush()
+            current = {"desc": desc, "date": "", "time": "",
+                       "amount": None, "sign": None}
+            if m_amt:
+                current["amount"] = _parse_amount(m_amt)
+                current["sign"] = m_amt.group(1)
+            if m_date:
+                current["date"], current["time"] = m_date.group(1), m_date.group(2)
+            continue
+        if current is not None:
+            if m_amt and current.get("amount") is None:
+                current["amount"] = _parse_amount(m_amt)
+                current["sign"] = m_amt.group(1)
+            if m_date and not current.get("date"):
+                current["date"], current["time"] = m_date.group(1), m_date.group(2)
+    flush()
+
+    out = []
+    seen = set()
+    for r in records:
+        if r["sign"] == "+":
+            signed = r["amount"]
+        elif r["sign"] == "-":
+            signed = -r["amount"]
+        elif "cash in" in r["desc"].lower() or "receive" in r["desc"].lower():
+            signed = r["amount"]
+        else:
+            signed = -r["amount"]
+        rec = {"date": r["date"], "time": r["time"],
+               "desc": r["desc"], "amount": signed}
+        key = (rec["date"], rec["time"], rec["desc"], rec["amount"])
+        if key not in seen:
+            seen.add(key)
+            out.append(rec)
+    return out
+
+
+async def ocr_image(image_bytes):
+    """Send a screenshot to OCR.space (free API) and return the text.
+    Returns None when the key is missing or the OCR call fails."""
+    key = os.environ.get("OCR_SPACE_KEY", "")
+    if not key:
+        log.error("OCR_SPACE_KEY is not set")
+        return None
+    data = image_bytes
+    if len(data) > 900_000:
+        # free tier caps at ~1 MB per image — downscale first
         try:
-            font = ImageFont.truetype(path, 36)
-            break
+            from PIL import Image
+            img = Image.open(BytesIO(data)).convert("RGB")
+            img.thumbnail((1600, 1600))
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=80)
+            data = buf.getvalue()
+        except Exception:
+            pass
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                "https://api.ocr.space/parse/image",
+                data={"apikey": key, "language": "eng",
+                      "isOverlayRequired": "false",
+                      "scale": "true", "OCREngine": "2"},
+                files={"file": ("screenshot.jpg", data, "image/jpeg")},
+            )
+        payload = resp.json()
+    except Exception as e:
+        log.error("OCR request error: %s", e)
+        return None
+    if payload.get("IsErroredOnProcessing"):
+        log.error("OCR error: %s", payload.get("ErrorMessage"))
+        return None
+    results = payload.get("ParsedResults") or []
+    if not results:
+        return None
+    return results[0].get("ParsedText", "")
+
+
+def _load_font(name, size):
+    from PIL import ImageFont
+    for path in (name,
+                 "/usr/share/fonts/truetype/dejavu/" + name,
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(path, size)
         except Exception:
             continue
-    if font is None:
-        font = ImageFont.load_default()
+    return ImageFont.load_default()
+
+
+def build_table_pdf(transactions):
+    """A4 portrait table: Date | Description | Amount, with totals.
+    Returns the PDF as bytes. (Pillow is imported lazily.)"""
+    from PIL import Image, ImageDraw
+
+    W, H = 1240, 1754  # A4 @ 150 dpi
+    MARGIN = 50
+    ROW_H = 52
+    f_title = _load_font("DejaVuSans-Bold.ttf", 38)
+    f_head = _load_font("DejaVuSans-Bold.ttf", 28)
+    f_row = _load_font("DejaVuSans.ttf", 28)
+    f_tot = _load_font("DejaVuSans-Bold.ttf", 30)
+
     today = yangon_today()
-    header = "KBZPay Transactions  -  " + today.strftime("%d %b %Y")
-    pages = []
-    for i in range(0, len(photo_bytes_list), 2):
+    title = "KBZPay Transactions  -  " + today.strftime("%d %b %Y")
+    col_date = MARGIN
+    col_desc = 300
+    col_amt_right = W - MARGIN
+    desc_w = col_amt_right - 260 - col_desc
+
+    def new_page(pages, number):
         page = Image.new("RGB", (W, H), "white")
         draw = ImageDraw.Draw(page)
-        draw.text((MARGIN, 30), header, fill="black", font=font)
-        draw.line([(MARGIN, HEADER_H), (W - MARGIN, HEADER_H)], fill="black", width=2)
-        pair = photo_bytes_list[i:i + 2]
-        slot_w = (W - 2 * MARGIN - GAP) // 2
-        slot_h = H - HEADER_H - MARGIN
-        slot_x = [MARGIN, MARGIN + slot_w + GAP]
-        for j, data in enumerate(pair):
-            img = Image.open(BytesIO(data)).convert("RGB")
-            img.thumbnail((slot_w, slot_h))
-            x = slot_x[j] + (slot_w - img.width) // 2
-            y = HEADER_H + 10
-            page.paste(img, (x, y))
-        pages.append(page)
+        draw.text((MARGIN, 30), title, fill="black", font=f_title)
+        draw.line([(MARGIN, 100), (W - MARGIN, 100)], fill="black", width=2)
+        draw.text((col_date, 125), "Date", fill="black", font=f_head)
+        draw.text((col_desc, 125), "Description", fill="black", font=f_head)
+        amt_h = "Amount (MMK)"
+        draw.text((col_amt_right - draw.textlength(amt_h, font=f_head), 125),
+                  amt_h, fill="black", font=f_head)
+        draw.line([(MARGIN, 175), (W - MARGIN, 175)], fill="black", width=2)
+        pages.append((page, draw))
+        return 190
+
+    pages = []
+    y = new_page(pages, 1)
+    for r in transactions:
+        if y + ROW_H > H - MARGIN:
+            y = new_page(pages, len(pages) + 1)
+        page, draw = pages[-1]
+        draw.text((col_date, y + 10), r["date"] + " " + r["time"],
+                  fill="black", font=f_row)
+        desc = r["desc"]
+        while draw.textlength(desc, font=f_row) > desc_w and len(desc) > 3:
+            desc = desc[:-2]
+        if desc != r["desc"]:
+            desc = desc[:-1] + "…"
+        draw.text((col_desc, y + 10), desc, fill="black", font=f_row)
+        amt = f"{r['amount']:+,.2f}"
+        color = (0, 130, 60) if r["amount"] > 0 else (180, 0, 0)
+        draw.text((col_amt_right - draw.textlength(amt, font=f_row), y + 10),
+                  amt, fill=color, font=f_row)
+        draw.line([(MARGIN, y + ROW_H - 8), (W - MARGIN, y + ROW_H - 8)],
+                  fill=(220, 220, 220), width=1)
+        y += ROW_H
+
+    total_in = sum(r["amount"] for r in transactions if r["amount"] > 0)
+    total_out = sum(r["amount"] for r in transactions if r["amount"] < 0)
+    net = total_in + total_out
+    if y + 3 * ROW_H + 60 > H - MARGIN:
+        y = new_page(pages, len(pages) + 1)
+    page, draw = pages[-1]
+    draw.line([(MARGIN, y + 6), (W - MARGIN, y + 6)], fill="black", width=2)
+    totals = [("Total In", total_in, (0, 130, 60)),
+              ("Total Out", total_out, (180, 0, 0)),
+              ("Net", net, (0, 0, 0))]
+    yy = y + 16
+    for label, value, color in totals:
+        draw.text((col_desc, yy), label, fill="black", font=f_tot)
+        amt = f"{value:+,.2f}"
+        draw.text((col_amt_right - draw.textlength(amt, font=f_tot), yy),
+                  amt, fill=color, font=f_tot)
+        yy += ROW_H
+    for i, (page, draw) in enumerate(pages):
+        draw.text((W - MARGIN - 90, H - 40), f"Page {i + 1}/{len(pages)}",
+                  fill=(120, 120, 120), font=f_row)
+
     out = BytesIO()
-    pages[0].save(out, format="PDF", save_all=True, append_images=pages[1:])
+    imgs = [p for p, _ in pages]
+    imgs[0].save(out, format="PDF", save_all=True, append_images=imgs[1:])
     return out.getvalue()
 
 
@@ -335,25 +514,42 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     chat_id = update.effective_chat.id
-    photos = update.message.photo or []
-    if not photos:
+    file_id = None
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id  # largest size
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        file_id = update.message.document.file_id
+    if not file_id:
         return
-    lst = PHOTOS.setdefault(chat_id, [])
-    if len(lst) >= MAX_PHOTOS:
-        await update.message.reply_text("ဓာတ်ပုံ ၅၀ ပုံ ပြည့်သွားပြီ — /pdf လို့ ရိုက်ပြီး PDF ထုတ်လိုက်ပါ။")
-        return
-    photo = photos[-1]  # largest size
     try:
-        tg_file = await context.bot.get_file(photo.file_id)
+        tg_file = await context.bot.get_file(file_id)
         buf = BytesIO()
         await tg_file.download_to_memory(buf)
-        lst.append(buf.getvalue())
+        image_bytes = buf.getvalue()
     except Exception as e:
         log.error("Photo download error: %s", e)
         await update.message.reply_text("⚠️ ပုံ download လုပ်လို့ မရဘူး — ပြန်ပို့ပေးပါ။")
         return
-    n = len(lst)
-    await update.message.reply_text(f"📸 {n} ပုံ ရပြီ — အားလုံးပို့ပြီးရင် /pdf လို့ ရိုက်ပါ။")
+    text = await ocr_image(image_bytes)
+    if text is None:
+        await update.message.reply_text("⚠️ စာဖတ်လို့ မရဘူး (OCR) — ခဏနေ ပြန်စမ်းပေးပါ။")
+        return
+    found = parse_transactions(text)
+    if not found:
+        await update.message.reply_text(
+            "⚠️ ဒီပုံထဲက transaction ဖတ်လို့ မရဘူး — ပုံကြည်လင်မှု စစ်ပြီး ပြန်ပို့ပေးပါ။")
+        return
+    lst = TRANSACTIONS.setdefault(chat_id, [])
+    lst.extend(found)
+    if len(lst) > MAX_TXNS:
+        lst = lst[-MAX_TXNS:]
+        TRANSACTIONS[chat_id] = lst
+    total_in = sum(r["amount"] for r in lst if r["amount"] > 0)
+    total_out = sum(r["amount"] for r in lst if r["amount"] < 0)
+    await update.message.reply_text(
+        f"📸 {len(found)} ခု တွေ့တယ် — စုစုပေါင်း {len(lst)} ခု\n"
+        f"အဝင်: +{total_in:,.2f}  |  အထွက်: {total_out:,.2f}\n"
+        "အားလုံးပို့ပြီးရင် /pdf လို့ ရိုက်ပါ။")
 
 
 async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -361,13 +557,13 @@ async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ဒီ bot ကို သုံးခွင့် မရှိဘူး။")
         return
     chat_id = update.effective_chat.id
-    lst = PHOTOS.get(chat_id, [])
+    lst = TRANSACTIONS.get(chat_id, [])
     if not lst:
-        await update.message.reply_text("ဓာတ်ပုံ မရှိသေးဘူး — KBZPay screenshot တွေ အရင် ပို့ပေးပါ။")
+        await update.message.reply_text("Transaction မရှိသေးဘူး — KBZPay screenshot တွေ အရင် ပို့ပေးပါ။")
         return
-    await update.message.reply_text(f"📄 PDF ထုတ်နေတယ် — {len(lst)} ပုံ…")
+    await update.message.reply_text(f"📄 PDF ထုတ်နေတယ် — {len(lst)} ခု…")
     try:
-        pdf_bytes = await asyncio.to_thread(build_pdf, list(lst))
+        pdf_bytes = await asyncio.to_thread(build_table_pdf, list(lst))
     except Exception as e:
         log.error("PDF build error: %s", e)
         await update.message.reply_text("⚠️ PDF ထုတ်လို့ မရဘူး — ပြန်စမ်းပေးပါ။")
@@ -376,17 +572,17 @@ async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filename = "KBZPay-" + today.strftime("%Y-%m-%d") + ".pdf"
     await context.bot.send_document(
         chat_id, document=BytesIO(pdf_bytes), filename=filename,
-        caption=f"📄 {today.strftime('%d %b %Y')} — {len(lst)} ပုံ",
+        caption=f"📄 {today.strftime('%d %b %Y')} — {len(lst)} ခု",
     )
-    PHOTOS[chat_id] = []
+    TRANSACTIONS[chat_id] = []
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("ဒီ bot ကို သုံးခွင့် မရှိဘူး။")
         return
-    PHOTOS[update.effective_chat.id] = []
-    await update.message.reply_text("🗑 ဓာတ်ပုံတွေ ဖျက်ပြီးပြီ — အစကနေ ပြန်ပို့လို့ရတယ်။")
+    TRANSACTIONS[update.effective_chat.id] = []
+    await update.message.reply_text("🗑 Transaction တွေ ဖျက်ပြီးပြီ — အစကနေ ပြန်ပို့လို့ရတယ်။")
 
 
 def create_web_app(app, token):
@@ -496,6 +692,7 @@ def main():
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lookup))
     app.add_handler(MessageHandler(filters.PHOTO, receive_photo))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, receive_photo))
     port = os.environ.get("PORT")
     if port:
         # Render (free): webhook mode — a Telegram message wakes the
